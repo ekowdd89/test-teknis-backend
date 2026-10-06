@@ -1,0 +1,69 @@
+# Otomatis digabung saat menjalankan `docker compose up`.
+# Untuk mode "production" tanpa file ini:
+#   docker compose -f docker-compose.yml up -d
+
+x-watch: &watch
+  watch:
+    - action: rebuild
+      path: ./cmd
+    - action: rebuild
+      path: ./internal
+    - action: rebuild
+      path: ./pkg
+    - action: rebuild
+      path: ./api
+    - action: rebuild
+      path: ./go.mod
+
+services:
+  # ---------- Akses langsung dari host untuk debugging ----------
+  # Port host sengaja digeser dari port standar agar tidak bentrok dengan
+  # Postgres/RabbitMQ/Mosquitto yang terpasang lokal. Ubah lewat env var bila perlu,
+  # mis. `POSTGRES_HOST_PORT=5432 make start`.
+  postgres:
+    ports:
+      - "${POSTGRES_HOST_PORT:-15432}:5432"
+
+  rabbitmq:
+    ports:
+      - "${RABBITMQ_HOST_PORT:-5673}:5672"
+      - "${RABBITMQ_UI_HOST_PORT:-15673}:15672" # Management UI: http://localhost:15673
+
+  mosquitto:
+    ports:
+      - "${MQTT_HOST_PORT:-11883}:1883"
+
+  server:
+    ports:
+      - "${SERVER_HOST_PORT:-8080}:8080" # REST langsung (tanpa Caddy)
+      - "${DELVE_HOST_PORT:-2345}:2345" # Delve, hanya aktif dengan `make debug`
+    environment:
+      LOG_LEVEL: debug
+    # Aktif hanya dengan `docker compose watch` atau `docker compose up --watch`.
+    develop: *watch
+
+  worker:
+    environment:
+      LOG_LEVEL: debug
+    develop: *watch
+
+  # ---------- Mock publisher (hanya untuk dev/demo) ----------
+  publisher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ${PROFILE_DOCKERFILE_TARGET:-runtime}
+    image: fleet-management:latest
+    command: ["/app/publisher"]
+    environment:
+      LOG_LEVEL: debug
+      MQTT_BROKER_URI: tcp://mosquitto:1883
+      MQTT_CLIENT_ID: fleet-publisher
+      PUBLISH_INTERVAL: 2s
+      VEHICLE_IDS: B1234XYZ,B5678ABC,B9012DEF
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      server:
+        condition: service_started
+    restart: unless-stopped

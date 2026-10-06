@@ -1,0 +1,152 @@
+name: fleet-management
+
+# ---------- Shared config ----------
+x-app-build: &app-build
+  context: .
+  dockerfile: Dockerfile
+  # `make debug` mengisi PROFILE_DOCKERFILE_TARGET=debugger.
+  target: ${PROFILE_DOCKERFILE_TARGET:-runtime}
+
+x-app-env: &app-env
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  DB_CONNECTION: postgres://${POSTGRES_USER:-fleet}:${POSTGRES_PASSWORD:-fleet}@postgres:5432/${POSTGRES_DB:-fleet}?sslmode=disable
+  # Nama variabel mengikuti yang dibaca pkg/mqtt & pkg/rabbitmq.
+  MQTT_BROKER_URI: tcp://mosquitto:1883
+  RABBITMQ_URI: amqp://${RABBITMQ_USER:-fleet}:${RABBITMQ_PASSWORD:-fleet}@rabbitmq:5672/
+  RABBITMQ_EXCHANGE: fleet.events
+  RABBITMQ_QUEUE: geofence_alerts
+  RABBITMQ_ROUTING_KEY: geofence.entry
+
+services:
+  # ---------- Infrastructure ----------
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fleet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fleet}
+      POSTGRES_DB: ${POSTGRES_DB:-fleet}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./internal/postgres/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    # Hostname tetap: data RabbitMQ disimpan per nama node.
+    hostname: rabbitmq
+    environment:
+      # User "guest" bawaan hanya boleh dari localhost, jadi buat user sendiri.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-fleet}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-fleet}
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    volumes:
+      - ./deployments/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquittodata:/mosquitto/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mosquitto_sub",
+          "-h",
+          "localhost",
+          "-t",
+          "$$SYS/broker/uptime",
+          "-C",
+          "1",
+          "-W",
+          "3",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------- Application ----------
+  server:
+    build: *app-build
+    image: fleet-management:latest
+    command: ["/app/server"]
+    environment:
+      <<: *app-env
+      MQTT_CLIENT_ID: fleet-server
+      MQTT_TOPIC: /fleet/vehicle/+/location
+      HTTP_ADDR: ":8080"
+      GEOFENCE_RADIUS_METERS: "50"
+      # Format: nama:lat:lon, dipisah koma
+      GEOFENCE_POINTS: ${GEOFENCE_POINTS:-bundaran-hi:-6.1950:106.8230,monas:-6.1754:106.8272,blok-m:-6.2443:106.8000}
+    expose:
+      - "8080"
+    depends_on:
+      # Schema dibuat oleh initdb Postgres (internal/postgres/schema.sql).
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    # Build & image sama dengan server (satu image, tiga binary);
+    # BuildKit memakai cache sehingga tidak membangun dua kali.
+    build: *app-build
+    image: fleet-management:latest
+    command: ["/app/worker"]
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------- Edge ----------
+  swagger-ui:
+    image: swaggerapi/swagger-ui:v5.18.2
+    environment:
+      # Harus sama dengan nama file di ./api (di-mount ke /spec).
+      SWAGGER_JSON: /spec/openapi-spec.yaml
+      BASE_URL: /docs
+    volumes:
+      - ./api:/spec:ro
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      # Default 8000 karena port 80 sering dipakai web server lokal (nginx/apache).
+      - "${HTTP_PORT:-8000}:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - server
+      - swagger-ui
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  rabbitmqdata:
+  mosquittodata:
+  caddy_data:
+  caddy_config:

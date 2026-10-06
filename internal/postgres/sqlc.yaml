@@ -1,0 +1,25 @@
+version: '2'
+sql:
+- engine: postgresql
+  queries: './query.sql'
+  schema: './schema.sql'
+  gen:
+    go:
+      package: "sqlc"
+      out: './sqlc'
+      sql_package: "database/sql"
+      emit_interface: true
+      emit_json_tags: true
+      emit_empty_slices: true
+      emit_result_struct_pointers: false
+      # Nama tabel "vehicle_loctions" mengikuti spesifikasi tes (typo),
+      # tapi struct Go tetap memakai nama yang benar.
+      rename:
+        vehicle_loction: VehicleLocation
+      overrides:
+      - db_type: uuid
+        go_type: github.com/google/uuid.UUID
+      - db_type: json
+        go_type: encoding/json.RawMessage
+      - db_type: jsonb
+        go_type: encoding/json.RawMessage

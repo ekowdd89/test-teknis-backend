@@ -1,0 +1,22 @@
+{
+	auto_https off
+}
+
+:80 {
+	encode gzip
+
+	# Swagger UI dari api/openapi-spec.yaml
+	handle /docs* {
+		reverse_proxy swagger-ui:8080
+	}
+
+	# REST API (Gin)
+	handle {
+		reverse_proxy server:8080
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

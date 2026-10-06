@@ -1,0 +1,332 @@
+openapi: "3.0.3"
+
+info:
+  title: "Fleet Management API"
+  version: "1.0.0"
+  description: |
+    REST API sistem manajemen armada Transjakarta.
+
+    Data lokasi diterima lewat MQTT pada topik
+    `/fleet/vehicle/{vehicle_id}/location` (payload: schema `VehicleLocation`),
+    disimpan ke PostgreSQL, lalu dapat diakses melalui endpoint di bawah.
+    Event geofence (radius 50 m) dikirim ke RabbitMQ exchange `fleet.events`
+    dan dibaca worker dari queue `geofence_alerts`.
+  license:
+    name: "Internal"
+    url: "http://localhost"
+
+servers:
+# URL relatif: request dikirim ke host yang sama dengan Swagger UI
+# (mis. http://localhost:8000 lewat Caddy), berapa pun port host-nya.
+- url: "/"
+  description: "Host yang sama dengan Swagger UI (Caddy, docker compose)"
+- url: "http://localhost:8080"
+  description: "Langsung ke service Gin (docker-compose.override.yaml)"
+
+tags:
+- name: Vehicles
+  description: Lokasi terakhir dan riwayat perjalanan kendaraan
+- name: Geofence
+  description: Event geofence yang sudah diproses worker
+- name: System
+  description: Health check
+
+paths:
+  /vehicles/{vehicle_id}/location:
+    get:
+      tags: [ Vehicles ]
+      operationId: getVehicleLocation
+      summary: Mendapatkan lokasi terakhir kendaraan
+      parameters:
+      - $ref: "#/components/parameters/VehicleID"
+      responses:
+        "200":
+          description: Lokasi terakhir kendaraan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VehicleLocation"
+              example:
+                vehicle_id: "B1234XYZ"
+                latitude: -6.2088
+                longitude: 106.8456
+                timestamp: 1715003456
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /vehicles/{vehicle_id}/history:
+    get:
+      tags: [ Vehicles ]
+      operationId: getVehicleHistory
+      summary: Mendapatkan riwayat lokasi dalam rentang waktu tertentu
+      description: |
+        Mengembalikan lokasi dengan `start <= timestamp <= end`, diurutkan
+        dari yang paling lama. Bila tidak ada data, dikembalikan array kosong.
+      parameters:
+      - $ref: "#/components/parameters/VehicleID"
+      - name: start
+        in: query
+        required: true
+        description: Awal rentang waktu (unix epoch, detik, inklusif)
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+        example: 1715000000
+      - name: end
+        in: query
+        required: true
+        description: Akhir rentang waktu (unix epoch, detik, inklusif). Harus >= start.
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+        example: 1715009999
+      - name: limit
+        in: query
+        required: false
+        description: Jumlah maksimum data yang dikembalikan
+        schema:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 10000
+          default: 1000
+      responses:
+        "200":
+          description: Riwayat lokasi kendaraan
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/VehicleLocation"
+              example:
+              - vehicle_id: "B1234XYZ"
+                latitude: -6.2088
+                longitude: 106.8456
+                timestamp: 1715003456
+              - vehicle_id: "B1234XYZ"
+                latitude: -6.2079
+                longitude: 106.8461
+                timestamp: 1715003458
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /vehicles/{vehicle_id}/geofence-events:
+    get:
+      tags: [ Geofence ]
+      operationId: listVehicleGeofenceEvents
+      summary: Daftar event geofence kendaraan yang sudah diproses worker
+      description: |
+        Data berasal dari worker yang mengonsumsi queue `geofence_alerts`,
+        sehingga endpoint ini membuktikan alur MQTT → PostgreSQL → RabbitMQ → worker.
+      parameters:
+      - $ref: "#/components/parameters/VehicleID"
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 1000
+          default: 100
+      responses:
+        "200":
+          description: Event geofence terbaru lebih dulu
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/GeofenceEvent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /healthz:
+    get:
+      tags: [ System ]
+      operationId: getHealth
+      summary: Status service dan dependensinya
+      responses:
+        "200":
+          description: Semua dependensi sehat
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "503":
+          description: Ada dependensi yang tidak sehat
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+components:
+  parameters:
+    VehicleID:
+      name: vehicle_id
+      in: path
+      required: true
+      description: Nomor polisi / ID kendaraan
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 20
+        pattern: "^[A-Za-z0-9-]+$"
+      example: "B1234XYZ"
+
+  schemas:
+    VehicleLocation:
+      type: object
+      description: |
+        Lokasi kendaraan. Bentuk yang sama dipakai sebagai payload MQTT
+        pada topik `/fleet/vehicle/{vehicle_id}/location`.
+      required: [ vehicle_id, latitude, longitude, timestamp ]
+      properties:
+        vehicle_id:
+          type: string
+          minLength: 1
+          maxLength: 20
+          example: "B1234XYZ"
+        latitude:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+          example: -6.2088
+        longitude:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+          example: 106.8456
+        timestamp:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Unix epoch (detik)
+          example: 1715003456
+
+    Location:
+      type: object
+      required: [ latitude, longitude ]
+      properties:
+        latitude:
+          type: number
+          format: double
+          example: -6.2088
+        longitude:
+          type: number
+          format: double
+          example: 106.8456
+
+    GeofenceAlertMessage:
+      type: object
+      description: |
+        Format pesan RabbitMQ (exchange `fleet.events`, queue `geofence_alerts`).
+        Didokumentasikan sebagai referensi; tidak dikembalikan oleh endpoint mana pun.
+      required: [ vehicle_id, event, location, timestamp ]
+      properties:
+        vehicle_id:
+          type: string
+          example: "B1234XYZ"
+        event:
+          type: string
+          enum: [ geofence_entry ]
+        location:
+          $ref: "#/components/schemas/Location"
+        timestamp:
+          type: integer
+          format: int64
+          example: 1715003456
+
+    GeofenceEvent:
+      type: object
+      required: [ vehicle_id, geofence_id, event, location, timestamp, received_at ]
+      properties:
+        vehicle_id:
+          type: string
+          example: "B1234XYZ"
+        geofence_id:
+          type: string
+          example: "monas"
+        event:
+          type: string
+          example: "geofence_entry"
+        location:
+          $ref: "#/components/schemas/Location"
+        timestamp:
+          type: integer
+          format: int64
+          example: 1715003456
+        received_at:
+          type: string
+          format: date-time
+          description: Waktu worker memproses event
+
+    Health:
+      type: object
+      required: [ status, checks ]
+      properties:
+        status:
+          type: string
+          enum: [ ok, degraded ]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [ up, down ]
+          example:
+            postgres: up
+            mqtt: up
+            rabbitmq: up
+
+    Error:
+      type: object
+      required: [ code, message ]
+      properties:
+        code:
+          type: string
+          example: "NOT_FOUND"
+        message:
+          type: string
+          example: "vehicle B1234XYZ not found"
+
+  responses:
+    BadRequest:
+      description: Parameter tidak valid (misalnya start > end atau format salah)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            code: "INVALID_ARGUMENT"
+            message: "start must be less than or equal to end"
+    NotFound:
+      description: Data kendaraan tidak ditemukan
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            code: "NOT_FOUND"
+            message: "vehicle B1234XYZ not found"
+    InternalError:
+      description: Kesalahan internal server
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            code: "INTERNAL"
+            message: "internal server error"
