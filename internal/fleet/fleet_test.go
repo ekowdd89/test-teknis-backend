@@ -1,12 +1,15 @@
 package fleet
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
 
 	"github.com/ekowdd89/test-teknis-backend/pkg/rabbitmq"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestParseGeofences(t *testing.T) {
@@ -137,5 +140,27 @@ func TestSimulatorVisitsGeofences(t *testing.T) {
 	}
 	if _, err := NewSimulator([]string{"A"}, gs[:1], 10); err == nil {
 		t.Error("expected error with one geofence")
+	}
+}
+
+func TestIsPermanentDBError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"value too long", &pgconn.PgError{Code: "22001"}, true},
+		{"invalid text", &pgconn.PgError{Code: "22P02"}, true},
+		{"unique violation (wrapped)", fmt.Errorf("insert: %w", &pgconn.PgError{Code: "23505"}), true},
+		{"not null violation", &pgconn.PgError{Code: "23502"}, true},
+		{"connection failure", &pgconn.PgError{Code: "08006"}, false},
+		{"admin shutdown", &pgconn.PgError{Code: "57P01"}, false},
+		{"plain error (mis. dial tcp)", errors.New("dial tcp: connection refused"), false},
+		{"context canceled", context.Canceled, false},
+	}
+	for _, tt := range tests {
+		if got := isPermanentDBError(tt.err); got != tt.want {
+			t.Errorf("%s: isPermanentDBError = %v, want %v", tt.name, got, tt.want)
+		}
 	}
 }

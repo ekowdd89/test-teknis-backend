@@ -1,5 +1,5 @@
 
-.PHONY: generate build test ci start stop purge explain sqlc seed
+.PHONY: generate build test ci start stop purge explain sqlc seed outbox-status outbox-requeue dlq-status
 
 generate:
 	go generate ./...
@@ -35,6 +35,22 @@ sqlc:
 # Isi data contoh ke Postgres di docker compose (idempotent, aman diulang).
 seed:
 	docker compose exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"' < ./internal/postgres/seed.sql
+# ---------- Operasional outbox & dead-letter queue ----------
+PSQL = docker compose exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"'
+
+# Jumlah event outbox per status + daftar event failed beserta error terakhir.
+outbox-status:
+	@echo "SELECT status, count(*) AS total, max(attempts) AS max_attempts, min(created_at) AS oldest FROM outbox_events GROUP BY status ORDER BY status;" | $(PSQL)
+	@echo "SELECT id, aggregate_id, event_type, attempts, left(last_error, 80) AS last_error FROM outbox_events WHERE status = 'failed' ORDER BY created_at LIMIT 20;" | $(PSQL)
+
+# Kirim ulang event failed (sama dengan query RequeueFailedOutboxEvents).
+outbox-requeue:
+	@echo "UPDATE outbox_events SET status = 'pending', attempts = 0, last_error = NULL, available_at = now() WHERE status = 'failed';" | $(PSQL)
+
+# Isi queue utama & dead-letter queue di RabbitMQ.
+dlq-status:
+	@docker compose exec -T rabbitmq rabbitmqctl list_queues name messages messages_unacknowledged consumers
+
 explain:
 	@go mod tidy
 	@go run github.com/sqlc-dev/sqlc/cmd/sqlc explain -f ./internal/postgres/sqlc.yaml

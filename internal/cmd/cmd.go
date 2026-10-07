@@ -33,9 +33,10 @@ type CMD struct {
 	GeofencePoints       string  `env:"GEOFENCE_POINTS" envDefault:"bundaran-hi:-6.1950:106.8230,monas:-6.1754:106.8272,blok-m:-6.2443:106.8000" json:"geofence_points"`
 	GeofenceRadiusMeters float64 `env:"GEOFENCE_RADIUS_METERS" envDefault:"50" json:"geofence_radius_meters"`
 
-	OutboxPollInterval time.Duration `env:"OUTBOX_POLL_INTERVAL" envDefault:"1s" json:"outbox_poll_interval"`
-	OutboxBatchSize    int32         `env:"OUTBOX_BATCH_SIZE" envDefault:"100" json:"outbox_batch_size"`
-	OutboxMaxAttempts  int32         `env:"OUTBOX_MAX_ATTEMPTS" envDefault:"10" json:"outbox_max_attempts"`
+	OutboxPollInterval  time.Duration `env:"OUTBOX_POLL_INTERVAL" envDefault:"1s" json:"outbox_poll_interval"`
+	OutboxBatchSize     int32         `env:"OUTBOX_BATCH_SIZE" envDefault:"100" json:"outbox_batch_size"`
+	OutboxMaxAttempts   int32         `env:"OUTBOX_MAX_ATTEMPTS" envDefault:"10" json:"outbox_max_attempts"`
+	OutboxStatsInterval time.Duration `env:"OUTBOX_STATS_INTERVAL" envDefault:"1m" json:"outbox_stats_interval"`
 
 	geofences []fleet.Geofence
 
@@ -112,6 +113,7 @@ func (c *CMD) initRelay(ctx context.Context) (err error) {
 		fleet.WithRelayInterval(c.OutboxPollInterval),
 		fleet.WithRelayBatchSize(c.OutboxBatchSize),
 		fleet.WithRelayMaxAttempts(c.OutboxMaxAttempts),
+		fleet.WithRelayStatsInterval(c.OutboxStatsInterval),
 		fleet.WithRelayLogger(c.logger.With("logger-name", "outbox-relay")),
 	)
 	if err != nil {

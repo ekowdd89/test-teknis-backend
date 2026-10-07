@@ -32,7 +32,9 @@ type Relay struct {
 	batchSize   int32
 	maxAttempts int32
 	maxBackoff  time.Duration
-	logger      *slog.Logger
+	// statsInterval: seberapa sering jumlah event per status dicatat ke log.
+	statsInterval time.Duration
+	logger        *slog.Logger
 }
 
 func WithRelayInterval(d time.Duration) RelayOptFunc {
@@ -65,6 +67,18 @@ func WithRelayMaxAttempts(n int32) RelayOptFunc {
 	}
 }
 
+// WithRelayStatsInterval mengatur seberapa sering jumlah event per status
+// (pending/published/failed) dicatat ke log.
+func WithRelayStatsInterval(d time.Duration) RelayOptFunc {
+	return func(r *Relay) error {
+		if d <= 0 {
+			return errors.New("fleet: relay stats interval must be > 0")
+		}
+		r.statsInterval = d
+		return nil
+	}
+}
+
 func WithRelayLogger(l *slog.Logger) RelayOptFunc {
 	return func(r *Relay) error {
 		r.logger = l
@@ -77,14 +91,15 @@ func NewRelay(pg *postgres.Postgres, publisher Publisher, opts ...RelayOptFunc) 
 		return nil, errors.New("fleet: postgres and publisher are required")
 	}
 	r = &Relay{
-		pg:          pg,
-		queries:     sqlc.New(pg.Db()),
-		publisher:   publisher,
-		interval:    time.Second,
-		batchSize:   100,
-		maxAttempts: 10,
-		maxBackoff:  5 * time.Minute,
-		logger:      slog.Default(),
+		pg:            pg,
+		queries:       sqlc.New(pg.Db()),
+		publisher:     publisher,
+		interval:      time.Second,
+		batchSize:     100,
+		maxAttempts:   10,
+		maxBackoff:    5 * time.Minute,
+		statsInterval: time.Minute,
+		logger:        slog.Default(),
 	}
 	for _, opt := range opts {
 		if err = opt(r); err != nil {
@@ -99,15 +114,43 @@ func (r *Relay) Run(ctx context.Context) error {
 	r.logger.Info("outbox relay started", "interval", r.interval.String(), "batch_size", r.batchSize)
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
+	stats := time.NewTicker(r.statsInterval)
+	defer stats.Stop()
+	r.logStats(ctx)
 	for {
 		r.drain(ctx)
 		select {
 		case <-ctx.Done():
 			r.logger.Info("outbox relay stopped")
 			return nil
+		case <-stats.C:
+			r.logStats(ctx)
 		case <-ticker.C:
 		}
 	}
+}
+
+// logStats mencatat jumlah event per status. Event "failed" tidak pernah
+// dicoba ulang otomatis, jadi dilaporkan sebagai WARN sampai di-requeue
+// (make outbox-requeue) atau dihapus.
+func (r *Relay) logStats(ctx context.Context) {
+	rows, err := r.queries.CountOutboxEventsByStatus(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			r.logger.Warn("outbox stats failed", "error", err)
+		}
+		return
+	}
+	counts := map[string]int64{"pending": 0, "published": 0, "failed": 0}
+	for _, row := range rows {
+		counts[row.Status] = row.Total
+	}
+	attrs := []any{"pending", counts["pending"], "published", counts["published"], "failed", counts["failed"]}
+	if counts["failed"] > 0 {
+		r.logger.Warn("outbox has failed events (run: make outbox-requeue)", attrs...)
+		return
+	}
+	r.logger.Info("outbox stats", attrs...)
 }
 
 // drain mengirim batch berulang sampai outbox kosong atau terjadi error.
@@ -142,7 +185,13 @@ func (r *Relay) RelayBatch(ctx context.Context) (published int, err error) {
 		}
 		for _, e := range events {
 			if errPub := r.publish(ctx, e); errPub != nil {
-				r.logger.Warn("outbox publish failed", "id", e.ID, "attempts", e.Attempts+1, "error", errPub)
+				if e.Attempts+1 >= r.maxAttempts {
+					r.logger.Error("outbox event failed permanently, will not be retried (run: make outbox-requeue)",
+						"id", e.ID, "event_type", e.EventType, "aggregate_id", e.AggregateID, "attempts", e.Attempts+1, "error", errPub)
+				} else {
+					r.logger.Warn("outbox publish failed, will retry", "id", e.ID, "attempts", e.Attempts+1,
+						"retry_in_seconds", r.backoffSeconds(e.Attempts), "error", errPub)
+				}
 				if err = q.MarkOutboxEventFailed(ctx, sqlc.MarkOutboxEventFailedParams{
 					ID:             e.ID,
 					LastError:      errPub.Error(),

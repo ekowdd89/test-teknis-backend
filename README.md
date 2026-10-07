@@ -742,7 +742,8 @@ Payload MQTT (`/fleet/vehicle/{vehicle_id}/location`):
 | `GEOFENCE_POINTS` | server, publisher | `bundaran-hi:-6.1950:106.8230,monas:-6.1754:106.8272,blok-m:-6.2443:106.8000` | Format `nama:lat:lon`, dipisah koma |
 | `OUTBOX_POLL_INTERVAL` | server | `1s` | Interval relay membaca outbox |
 | `OUTBOX_BATCH_SIZE` | server | `100` | Jumlah event per batch relay |
-| `OUTBOX_MAX_ATTEMPTS` | server | `10` | Setelah ini event berstatus `failed` (lihat `RequeueFailedOutboxEvents`) |
+| `OUTBOX_MAX_ATTEMPTS` | server | `10` | Setelah ini event berstatus `failed` dan tidak dicoba ulang otomatis (lihat `make outbox-requeue`) |
+| `OUTBOX_STATS_INTERVAL` | server | `1m` | Interval log jumlah event per status; `WARN` bila ada yang `failed` |
 | `WORKER_CONSUMER_NAME` | worker | `geofence-alert-worker` | Nama consumer di tabel inbox |
 | `PUBLISH_INTERVAL` | publisher | `2s` | Interval kirim lokasi (minimal `1s`) |
 | `PUBLISH_STEPS_PER_LEG` | publisher | `30` | Jumlah titik antar dua geofence |
@@ -873,6 +874,9 @@ go run ./cmd/server
 | `make generate` | `go generate ./... && go mod tidy` | Generate oapi-codegen + sqlc |
 | `make sqlc` | `sqlc generate -f ./internal/postgres/sqlc.yaml` | Generate sqlc saja |
 | `make seed` | `psql < internal/postgres/seed.sql` di container `postgres` | Isi data contoh (idempotent) |
+| `make outbox-status` | `psql` | Jumlah event outbox per status + daftar event `failed` dan error terakhirnya |
+| `make outbox-requeue` | `psql` (= `RequeueFailedOutboxEvents`) | Kembalikan event `failed` ke `pending` dengan `attempts = 0` |
+| `make dlq-status` | `rabbitmqctl list_queues` | Isi `geofence_alerts` dan `geofence_alerts.dlq` |
 | `make build` | `go build ./...` | Compile semua package |
 | `make test` | `cd .dagger && go run . ..` | Test via Dagger (Postgres, RabbitMQ, Mosquitto di container) |
 | `make ci` | Dagger di dalam container | Menjalankan pipeline CI |
@@ -917,10 +921,12 @@ Opsi `New`: `WithEnvPrefix("FLEET_")` (semua env var diberi prefix),
 | Payload MQTT tidak valid / `vehicle_id` beda dengan topik | Dibuang dengan log `WARN` (MQTT tidak punya nack) |
 | Database error saat ingest | Dicoba ulang 3× (jeda 1 detik) |
 | RabbitMQ down | Event tetap `pending` di outbox (jatah `attempts` tidak terpakai), terkirim otomatis setelah reconnect |
-| Publish gagal saat RabbitMQ terhubung | `attempts + 1`, backoff 1, 2, 4, … detik (maks 5 menit); `failed` setelah `OUTBOX_MAX_ATTEMPTS` |
+| Publish gagal saat RabbitMQ terhubung | `attempts + 1`, backoff 1, 2, 4, … detik (maks 5 menit); `failed` setelah `OUTBOX_MAX_ATTEMPTS` dengan log `ERROR` |
+| Event outbox `failed` | Tidak dicoba ulang otomatis. Terlihat di log `WARN` tiap `OUTBOX_STATS_INTERVAL` dan `make outbox-status`; kirim ulang dengan `make outbox-requeue` setelah penyebabnya diperbaiki |
 | Pesan RabbitMQ duplikat | Inbox `(consumer, message_id)` → di-ack tanpa diproses ulang |
 | Pesan RabbitMQ rusak (JSON salah, tanpa `geofence_id`/`message_id`) | Ditolak permanen → masuk `geofence_alerts.dlq` |
-| Database error di worker | Nack + requeue setelah jeda 2 detik |
+| Database tidak tersedia di worker (koneksi putus, timeout) | Nack + requeue setelah jeda 2 detik, terus sampai database pulih |
+| Data ditolak database di worker (SQLSTATE kelas `22`/`23`, mis. nilai terlalu panjang) | Ditolak permanen → `geofence_alerts.dlq` (mengulang tidak akan berhasil) |
 
 ---
 

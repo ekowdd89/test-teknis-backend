@@ -11,6 +11,7 @@ import (
 	"github.com/ekowdd89/test-teknis-backend/internal/postgres"
 	"github.com/ekowdd89/test-teknis-backend/internal/postgres/sqlc"
 	"github.com/ekowdd89/test-teknis-backend/pkg/rabbitmq"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const DefaultConsumerName = "geofence-alert-worker"
@@ -95,7 +96,12 @@ func (c *Consumer) Handle(ctx context.Context, msg rabbitmq.Message) (err error)
 		return nil
 	})
 	if err != nil {
-		return err // sementara: di-requeue oleh pkg/rabbitmq
+		if isPermanentDBError(err) {
+			// Data ditolak database (mis. nilai terlalu panjang): mengulang tidak
+			// akan pernah berhasil, jadi kirim ke DLQ alih-alih requeue tanpa akhir.
+			return rabbitmq.Permanent(err)
+		}
+		return err // sementara (mis. database down): di-requeue oleh pkg/rabbitmq
 	}
 
 	if duplicate {
@@ -112,4 +118,19 @@ func (c *Consumer) Handle(ctx context.Context, msg rabbitmq.Message) (err error)
 		"timestamp", alert.Timestamp,
 	)
 	return nil
+}
+
+// isPermanentDBError: SQLSTATE kelas 22 (data exception) dan 23 (integrity
+// constraint violation) selalu gagal untuk data yang sama. Error koneksi atau
+// timeout bukan *pgconn.PgError sehingga tetap dianggap sementara.
+func isPermanentDBError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
+		return false
+	}
+	switch pgErr.Code[:2] {
+	case "22", "23":
+		return true
+	}
+	return false
 }
