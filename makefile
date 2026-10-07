@@ -19,16 +19,16 @@ ci:
 	docker rmi -f $$(docker images -q --filter=label=test) || true
 
 start:
-	docker compose up --build
+	docker compose up -d --build
 
 debug:
-	PROFILE_DOCKERFILE_TARGET=debugger docker compose up --build
+	PROFILE_DOCKERFILE_TARGET=debugger docker compose up -d --build
 
 stop:
 	docker compose down
 
 purge:
-	docker compose -f docker-compose.yml down --volumes
+	docker compose -f docker-compose.yml down --volumes --remove-orphans
 sqlc:
 	sqlc generate -f ./internal/postgres/sqlc.yaml
 
