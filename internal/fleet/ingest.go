@@ -133,7 +133,9 @@ func (i *Ingestor) Handle(ctx context.Context, topic string, payload []byte) (er
 		}
 		if n == 0 {
 			// Duplikat (QoS 1 bisa mengirim ulang): geofence sudah diproses sebelumnya.
-			i.logger.Debug("duplicate location ignored", "vehicle_id", loc.VehicleID, "timestamp", loc.Timestamp)
+			i.logger.Info("duplicate location ignored (vehicle_id + timestamp already stored)",
+				"vehicle_id", loc.VehicleID, "timestamp", loc.Timestamp,
+				"latitude", loc.Latitude, "longitude", loc.Longitude)
 			return nil
 		}
 

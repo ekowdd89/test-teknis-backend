@@ -10,19 +10,20 @@ diterima lewat **MQTT**, disimpan ke **PostgreSQL**, dicek terhadap **geofence**
 ## Daftar Isi
 
 1. [Arsitektur](#arsitektur)
-2. [Alur Data](#alur-data)
-3. [Arsitektur Kode & Design Pattern](#arsitektur-kode--design-pattern)
-4. [Struktur Direktori](#struktur-direktori)
-5. [Teknologi & Library](#teknologi--library)
-6. [Skema Database](#skema-database)
-7. [sqlc (Query Type-Safe)](#sqlc-query-type-safe)
-8. [Penggunaan Library Internal](#penggunaan-library-internal)
-9. [REST API](#rest-api)
-10. [Konfigurasi (Environment Variable)](#konfigurasi-environment-variable)
-11. [Menjalankan Aplikasi](#menjalankan-aplikasi)
-12. [Perintah Makefile](#perintah-makefile)
-13. [Alur startup server](#alur-startup-server)
-14. [Status Implementasi & Catatan](#status-implementasi--catatan)
+2. [Jenis Arsitektur & Alasan](#jenis-arsitektur--alasan)
+3. [Alur Data](#alur-data)
+4. [Arsitektur Kode & Design Pattern](#arsitektur-kode--design-pattern)
+5. [Struktur Direktori](#struktur-direktori)
+6. [Teknologi & Library](#teknologi--library)
+7. [Skema Database](#skema-database)
+8. [sqlc (Query Type-Safe)](#sqlc-query-type-safe)
+9. [Penggunaan Library Internal](#penggunaan-library-internal)
+10. [REST API](#rest-api)
+11. [Konfigurasi (Environment Variable)](#konfigurasi-environment-variable)
+12. [Menjalankan Aplikasi](#menjalankan-aplikasi)
+13. [Perintah Makefile](#perintah-makefile)
+14. [Alur startup server](#alur-startup-server)
+15. [Status Implementasi & Catatan](#status-implementasi--catatan)
 
 ---
 
@@ -75,6 +76,145 @@ Satu image Docker berisi tiga binary: `server`, `worker`, dan `publisher`
 | **`FOR UPDATE SKIP LOCKED`** | `ClaimPendingOutboxEvents` | Beberapa instance relay bisa berjalan paralel tanpa mengirim event yang sama. |
 | **Retry + backoff** | `MarkOutboxEventFailed` | Event gagal dicoba ulang dengan jeda; setelah `max_attempts` statusnya `failed`. |
 | **Inbox (idempotent consumer)** | `inbox_messages` PK `(consumer, message_id)` | RabbitMQ menjamin *at-least-once*; inbox membuat efek bisnis menjadi *exactly-once*. |
+
+---
+
+## Jenis Arsitektur & Alasan
+
+Sistem ini bukan satu "jenis arsitektur" tunggal. Ia menggabungkan beberapa gaya, masing-masing
+dipilih untuk masalah tertentu. Ringkasnya:
+
+| Lingkup | Jenis arsitektur | Wujud di proyek ini |
+| --- | --- | --- |
+| Sistem (antar proses) | **Event-Driven Architecture** | MQTT untuk data masuk, RabbitMQ untuk event `geofence_entry` |
+| Deployment | **Modular monolith, multi-proses** | Satu codebase & satu image, dijalankan sebagai `server`, `worker`, `publisher` |
+| Kode (dalam proses) | **Layered + Ports & Adapters (ringan)** | `cmd` → `internal/cmd` → `httpserver`/`fleet` → `postgres` → `pkg` |
+| Data | **Pemisahan jalur tulis & baca (CQRS ringan)** | Tulis lewat MQTT/worker, baca lewat REST |
+| Edge | **Reverse proxy + contract-first API** | Caddy di depan Gin; API setup dari OpenAPI |
+
+### 1. Event-Driven Architecture (EDA)
+
+**Bentuknya:** komponen tidak saling memanggil langsung. Kendaraan *mengirim event lokasi*
+ke broker MQTT, dan server bereaksi. Saat kendaraan masuk geofence, server *menerbitkan event*
+`geofence_entry` ke RabbitMQ, lalu worker bereaksi. Tidak ada komponen yang menunggu
+balasan dari komponen lain.
+
+**Alasan:**
+- **Sesuai sifat datanya.** Lokasi kendaraan adalah aliran kejadian yang terus-menerus,
+  bukan request yang menunggu jawaban. Kendaraan tidak perlu tahu siapa yang memproses datanya.
+- **Decoupling.** Publisher, server, dan worker bisa di-deploy, di-restart, dan diskalakan
+  sendiri-sendiri. Worker mati tidak menghentikan ingest. Pesan menunggu di queue.
+- **Ketahanan terhadap gangguan.** MQTT QoS 1 dan sesi persisten menahan pesan saat server
+  restart. Antrean RabbitMQ yang *durable* menahan event saat worker mati.
+- **Mudah menambah konsumen baru.** Misalnya notifikasi atau analitik cukup membuat queue
+  baru yang di-*bind* ke exchange `fleet.events`, tanpa mengubah server.
+
+**Kenapa dua broker (MQTT *dan* RabbitMQ)?**
+
+| | MQTT (Mosquitto) | RabbitMQ (AMQP) |
+| --- | --- | --- |
+| Peran | Jalur **masuk** dari perangkat | Jalur **event internal** antar layanan |
+| Alasan dipilih | Protokol ringan untuk perangkat IoT/kendaraan dengan jaringan tidak stabil; topik wildcard per kendaraan | Routing (exchange/binding), *publisher confirm*, ack per pesan, dead-letter queue, competing consumers |
+| Yang tidak dimiliki pihak lain | — | MQTT tidak punya nack, DLQ, maupun routing berbasis exchange |
+
+**Trade-off:** sistem bersifat *eventually consistent*. `geofence_events` baru terisi sekitar
+0,5 detik setelah lokasi masuk. Alurnya juga lebih sulit dilacak daripada pemanggilan langsung,
+karena itu disediakan `make trace-flow`.
+
+### 2. Modular monolith yang dijalankan sebagai beberapa proses
+
+**Bentuknya:** satu repository, satu `go.mod`, dan satu image Docker berisi tiga binary.
+`server` menangani ingest MQTT, outbox relay, dan REST. `worker` mengonsumsi RabbitMQ.
+`publisher` adalah mock. Ketiganya memakai package `internal/` yang sama dan **satu database**.
+
+**Alasan:**
+- **Skala masalahnya kecil.** Satu domain (armada & geofence), tiga tabel inti, satu tim.
+  Microservices penuh hanya menambah biaya operasional (banyak repo, banyak database,
+  kontrak antar layanan) tanpa manfaat sepadan.
+- **Tetap bisa diskalakan per peran.** Karena `server` dan `worker` adalah proses terpisah,
+  beban consume bisa ditambah dengan menjalankan lebih banyak `worker` tanpa menggandakan REST API.
+- **Konsistensi kode.** Model pesan (`fleet.GeofenceAlertMessage`) dan topologi RabbitMQ
+  (`fleet.RabbitTopology`) dipakai bersama oleh server dan worker, jadi keduanya tidak mungkin
+  tidak sinkron.
+- **Jalan menuju pemisahan tetap terbuka.** Batasnya sudah jelas lewat event. Bila kelak
+  perlu dipisah, worker bisa menjadi layanan sendiri dengan database sendiri tanpa mengubah
+  kontrak pesannya.
+
+**Kenapa bukan microservices:** `server` dan `worker` **berbagi satu database PostgreSQL**.
+Dalam microservices yang ketat, tiap layanan memiliki datanya sendiri. Ini pilihan sadar demi
+kesederhanaan, dan tercatat sebagai batasan.
+
+### 3. Layered + Ports & Adapters (ringan) di dalam kode
+
+**Bentuknya:** dependensi hanya mengarah ke bawah (lihat
+[Lapisan dan arah dependensi](#lapisan-dan-arah-dependensi)). Logika bisnis ada di
+`internal/fleet`. Cara data masuk dan keluar dipasang sebagai **adapter**: HTTP (`httpserver`),
+MQTT handler (`Ingestor.MQTTHandler`), consumer RabbitMQ (`Consumer.Handle`). Semuanya
+dirakit di satu **composition root** (`internal/cmd`).
+
+**Alasan:**
+- **Logika bisnis tidak bergantung pada transport.** Aturan geofence dan outbox tidak tahu
+  apakah datanya datang dari MQTT, test, atau sumber lain di masa depan.
+- **Mudah dites.** Handler HTTP dites dengan `sqlc.Querier` palsu tanpa database. Relay hanya
+  bergantung pada interface kecil `fleet.Publisher` (2 method).
+- **Mudah dipahami developer baru.** Setiap folder punya satu tanggung jawab yang jelas.
+
+**Kenapa disebut "ringan":** `internal/fleet` masih memakai `postgres.Postgres` dan query
+sqlc secara langsung, tanpa interface repository di antaranya. Hexagonal/Clean Architecture
+yang ketat akan menambah lapisan abstraksi itu. Untuk ukuran proyek ini, abstraksi tersebut
+menambah kode tanpa manfaat nyata. sqlc sudah memberi `Querier` sebagai interface bila diperlukan.
+
+### 4. Pemisahan jalur Write dan Read (CQRS ringan)
+
+**Bentuknya:**
+- **Jalur tulis:** MQTT → transaksi ingest → outbox → RabbitMQ → worker → `geofence_events`.
+- **Jalur baca:** REST API hanya `SELECT` dari `vehicle_loctions` dan `geofence_events`.
+  REST tidak pernah menulis.
+
+`geofence_events` berperan sebagai *read model* yang dibangun dari event oleh worker.
+
+**Alasan:**
+- **Beban Write yang tinggi** (setiap kendaraan mengirim lokasi tiap beberapa detik) tidak
+  bersaing dengan logika API. API cukup query sederhana dengan index yang tepat.
+- **Read model bisa dibangun ulang dari event**, dan konsumen lain bisa membangun read model
+  berbeda dari event yang sama.
+
+**Kenapa "ringan":** kedua jalur masih memakai database yang sama. CQRS penuh biasanya memisahkan
+penyimpanan tulis dan baca.
+
+### 5. Reverse proxy & contract-first API di edge
+
+**Bentuknya:** Caddy menerima semua request di port 8000, meneruskan REST ke Gin dan `/docs`
+ke Swagger UI. Kontrak API ditulis dulu di `api/openapi-spec.yaml`, lalu kode server
+dibangkitkan dengan `oapi-codegen`.
+
+**Alasan:**
+- **Satu pintu masuk.** Kompresi, logging akses, dan (kelak) TLS dikelola di satu tempat,
+  bukan di setiap layanan.
+- **Spesifikasi menjadi sumber kebenaran.** Dokumentasi Swagger dan implementasi tidak bisa
+  berbeda. Endpoint baru di spec yang belum diimplementasikan menyebabkan gagal compile.
+
+### Pola keandalan yang menopang arsitektur ini
+
+EDA dengan broker berarti pesan bisa terkirim ulang atau hilang di tengah jalan. Karena itu
+arsitektur ini **membutuhkan** pola pendukung berikut (detail di
+[Katalog pattern lainnya](#katalog-pattern-lainnya)):
+
+| Masalah EDA | Pola yang dipakai |
+| --- | --- |
+| Lokasi tersimpan tapi event hilang saat RabbitMQ mati | **Transactional Outbox** |
+| Pesan terkirim lebih dari sekali (at-least-once) | **Idempotent Receiver** (`UNIQUE`) & **Inbox** |
+| Pesan rusak diulang terus-menerus | **Dead Letter Queue** |
+| Beberapa instance relay mengirim event yang sama | **Competing Consumers** (`FOR UPDATE SKIP LOCKED`) |
+
+### Kapan arsitektur ini perlu diubah
+
+| Kondisi | Perubahan yang disarankan |
+| --- | --- |
+| Ribuan kendaraan, polling outbox 1 detik jadi bottleneck | Ganti polling dengan *Change Data Capture* (mis. Debezium) atau `LISTEN/NOTIFY` |
+| Worker butuh skala dan siklus rilis sendiri | Pisahkan worker menjadi layanan dengan database sendiri (menuju microservices) |
+| Query riwayat lokasi sangat besar | Pindahkan `vehicle_loctions` ke time-series DB (mis. TimescaleDB), atau partisi tabel per waktu |
+| Banyak konsumen event yang berbeda | Tambah queue baru yang di-*bind* ke `fleet.events`; server tidak perlu diubah |
 
 ---
 
@@ -146,7 +286,7 @@ flowchart TB
 | Lapisan | Tanggung jawab | Tidak boleh tahu tentang |
 | --- | --- | --- |
 | `cmd/*` | Menangkap sinyal OS (`SIGINT`/`SIGTERM`), memanggil `New` lalu `Run` | Apa pun selain `internal/cmd` |
-| `internal/cmd` | **Merakit** semua komponen: baca env, buat koneksi, sambungkan dependensi, urutan shutdown | Aturan bisnis (geofence, outbox) |
+| `internal/cmd` | **Implementasi** semua komponen: baca env, buat koneksi, sambungkan dependensi, urutan shutdown | Aturan bisnis (geofence, outbox) |
 | `internal/httpserver` | Validasi request HTTP, mapping ke query, format respons/error sesuai OpenAPI | MQTT, RabbitMQ |
 | `internal/fleet` | Aturan bisnis: validasi payload, deteksi geofence, transactional outbox, idempotensi worker | HTTP, Gin, env var |
 | `internal/postgres` | Koneksi, retry saat startup, helper transaksi; query di-generate sqlc | Aturan bisnis |
@@ -389,7 +529,8 @@ if err != nil {
 │   ├── mqtt/                      # Wrapper Paho MQTT (auto-reconnect, re-subscribe)
 │   └── rabbitmq/                  # Wrapper AMQP (reconnect, topology, confirms)
 ├── deployments/
-│   └── mosquitto.conf             # Konfigurasi broker MQTT
+│   ├── mosquitto.conf             # Konfigurasi broker MQTT
+│   └── rabbitmq/enabled_plugins   # + rabbitmq_tracing (hanya di-mount di override/dev)
 ├── .dagger/                       # Pipeline test/CI berbasis Dagger
 ├── Caddyfile                      # Reverse proxy (REST, /docs)
 ├── Dockerfile                     # Multi-stage build (distroless, non-root)
@@ -848,6 +989,24 @@ curl localhost:8000/vehicles/B4321ABC/geofence-events
 
 `-t` (topik) dan `-m` (pesan) wajib; `vehicle_id` di payload harus sama dengan topik.
 
+Atau cukup `make publish-test` (default `TEST-01` di Monas, timestamp sekarang), yang
+langsung menampilkan hasil `/location` dan `/geofence-events`:
+
+```bash
+make publish-test
+make publish-test VEHICLE=B4321ABC LAT=-8.1754 LON=109.8272
+```
+
+> **Data tidak masuk?** Periksa hal berikut:
+> - **Timestamp harus baru.** Pasangan `vehicle_id + timestamp` yang sudah tersimpan
+>   dianggap duplikat (pengaman QoS 1) dan diabaikan, dengan log
+>   `duplicate location ignored`. Pakai `$(date +%s)`, bukan angka tetap.
+> - **Hindari `B1234XYZ`/`B5678ABC`/`B9012DEF` selama publisher mock berjalan.**
+>   `/location` mengembalikan timestamp terbaru, jadi data manual dengan timestamp lama
+>   akan tertutup data publisher.
+> - **MQTT tidak memberi balasan aplikasi.** `mosquitto_pub` hanya menerima ack dari broker.
+>   Cek hasilnya lewat API atau `docker compose logs server`.
+
 Memantau alurnya:
 
 ```bash
@@ -856,6 +1015,102 @@ docker compose logs -f server worker | grep -E "geofence entry|published|alert r
 
 RabbitMQ Management (`http://localhost:15673`, `fleet`/`fleet`) menampilkan koneksi
 server & worker, queue `geofence_alerts` (1 consumer), dan `geofence_alerts.dlq`.
+
+### Memantau dari RabbitMQ Management
+
+**Penting:** tidak setiap lokasi MQTT masuk RabbitMQ. Yang di-publish ke exchange
+`fleet.events` hanya event **`geofence_entry`**, yaitu saat kendaraan *baru masuk* radius
+geofence. Lokasi yang jauh dari geofence (mis. `-8.1754, 109.8272`) hanya tersimpan di
+PostgreSQL. Selain itu, queue `geofence_alerts` hampir selalu tampak **kosong** karena worker
+langsung meng-ack setiap pesan dalam hitungan milidetik.
+
+Buka `http://localhost:15673` (`fleet` / `fleet`):
+
+| Menu | Yang terlihat |
+| --- | --- |
+| **Overview** | Grafik *Message rates*: publish, deliver, dan ack naik bersamaan setiap ada event |
+| **Connections** | 2 koneksi: server (2 channel: publish + deklarasi) dan worker (1 channel consume) |
+| **Exchanges → `fleet.events`** | Binding ke `geofence_alerts` dengan routing key `geofence.entry`, rate *publish in/out* |
+| **Queues → `geofence_alerts`** | 1 consumer, *Message rates* (publish → deliver → ack); *Get messages* hanya berisi saat worker dihentikan |
+| **Queues → `geofence_alerts.dlq`** | Pesan yang ditolak permanen oleh worker |
+| **Admin → Tracing** | Trace `fleet-events` beserta file log setiap pesan yang di-publish (setelah `make rabbit-trace-start`) |
+
+**Melihat isi setiap pesan tanpa menghentikan worker** (plugin `rabbitmq_tracing`, aktif
+hanya di dev lewat `docker-compose.override.yaml`):
+
+```bash
+make rabbit-trace-start                       # mulai mencatat publish ke fleet.events
+make publish-test VEHICLE=B$(date +%H%M%S)    # kendaraan BARU ke Monas → memicu event
+make rabbit-trace-log                         # satu baris JSON per pesan
+make rabbit-trace-stop                        # hentikan & hapus log
+```
+
+Contoh keluaran `make rabbit-trace-log`:
+
+```json
+{"time":"2026-10-07T04:51:53.184+00:00","exchange":"fleet.events","routing_key":"geofence.entry","routed_queues":["geofence_alerts"],"message_id":"aa396077-…","geofence_id":"monas","payload":{"vehicle_id":"TR-115152","event":"geofence_entry","location":{"latitude":-6.1754,"longitude":106.8272},"timestamp":1791348712}}
+```
+
+`routed_queues` membuktikan pesan diteruskan ke `geofence_alerts`. Trace juga mencatat
+event dari publisher mock.
+
+**Melihat pesan tertahan di queue** (cocok untuk demo):
+
+```bash
+make publish-rabbit
+```
+
+Langkahnya:
+1. Worker dihentikan.
+2. Kendaraan baru dikirim ke Monas.
+3. Queue menampilkan `geofence_alerts 1 0` (1 pesan, 0 consumer), lalu isi pesannya
+   dibaca dan dikembalikan ke queue.
+4. Worker dinyalakan lagi, queue kembali `0 1`, dan log worker mencatat `geofence alert received`.
+
+Worker selalu dinyalakan kembali walau ada langkah yang gagal.
+
+> Plugin tracing login sebagai `guest` secara default, sedangkan user itu tidak ada di stack
+> ini. Karena itu `make rabbit-trace-start` mengirim kredensial per-trace
+> (`tracer_connection_username/password`). Bila membuat trace manual di UI, isi kolom
+> *Tracer connection username/password* dengan `fleet` / `fleet`.
+
+### Menelusuri satu event dari MQTT sampai worker
+
+Alurnya berjalan otomatis. Yang perlu diingat: **server (outbox relay) yang publish ke
+RabbitMQ, worker hanya consume**. Tidak ada komponen yang publish balik dari worker.
+
+| # | Dari → ke | Cara komunikasi | Data ditulis ke |
+| --- | --- | --- | --- |
+| 1 | publisher/kendaraan → Mosquitto → **server** | MQTT pub/sub QoS 1, topik `/fleet/vehicle/{id}/location`; server subscribe `/fleet/vehicle/+/location` dengan sesi persisten | `vehicle_loctions` (semua lokasi) |
+| 2 | server (cek jarak haversine) | di dalam proses, transaksi yang sama | `vehicle_geofence_presence` (masuk → insert, keluar → delete) |
+| 3 | server | transaksi yang sama, **hanya saat baru masuk** geofence | `outbox_events` status `pending` |
+| 4 | **server (relay)** → RabbitMQ | AMQP publish ke exchange `fleet.events`, routing key `geofence.entry`, menunggu *publisher confirm*; `message_id` = `outbox_events.id` | status outbox → `published` |
+| 5 | RabbitMQ → **worker** | AMQP consume queue `geofence_alerts`, ack setelah commit | `inbox_messages` + `geofence_events` |
+| 6 | client → server | REST (lewat Caddy) | — (membaca `vehicle_loctions` & `geofence_events`) |
+
+Telusuri satu event lengkap dengan satu perintah (read-only):
+
+```bash
+make trace-flow                    # event geofence terbaru
+make trace-flow VEHICLE=B5678ABC   # event terbaru kendaraan tertentu
+```
+
+Keluarannya menampilkan isi kelima tabel untuk event itu, log server/worker berurutan
+waktu, dan latensinya. Contoh nyata dari publisher mock:
+
+```text
+Event: message_id=2a841039-… vehicle=B5678ABC timestamp=1791349372
+[1] vehicle_loctions            created_at   05:02:52.504
+[3] outbox_events  published    created_at   05:02:52.504   published_at 05:02:53.044
+[5] inbox_messages              processed_at 05:02:53.060
+Latensi: outbox_ke_rabbitmq 0.54s | rabbitmq_ke_worker 0.016s | total 0.56s
+Log: geofence entry detected → outbox event published → geofence alert received
+```
+
+`created_at` lokasi dan outbox **sama persis** karena keduanya ditulis dalam satu transaksi.
+Jeda sekitar 0,5 detik berasal dari interval polling relay (`OUTBOX_POLL_INTERVAL=1s`).
+Bila kendaraan belum punya event, `make trace-flow VEHICLE=...` menampilkan lokasi
+terakhirnya dan menjelaskan bahwa lokasi di luar geofence tidak dikirim ke RabbitMQ.
 
 ### Lokal (tanpa Docker untuk aplikasi)
 
@@ -874,6 +1129,10 @@ go run ./cmd/server
 | `make generate` | `go generate ./... && go mod tidy` | Generate oapi-codegen + sqlc |
 | `make sqlc` | `sqlc generate -f ./internal/postgres/sqlc.yaml` | Generate sqlc saja |
 | `make seed` | `psql < internal/postgres/seed.sql` di container `postgres` | Isi data contoh (idempotent) |
+| `make publish-test` | `mosquitto_pub` + `curl` | Kirim 1 lokasi uji (`VEHICLE`, `LAT`, `LON`, timestamp sekarang) lalu tampilkan hasil API |
+| `make rabbit-trace-start` / `rabbit-trace-log` / `rabbit-trace-stop` | Management API + plugin `rabbitmq_tracing` | Catat & tampilkan setiap pesan yang di-publish ke `fleet.events` (dev) |
+| `make publish-rabbit` | `docker compose stop/start worker` + Management API | Demo pesan tertahan di `geofence_alerts`, lalu dikonsumsi worker |
+| `make trace-flow [VEHICLE=...]` | `psql` + `docker compose logs` (read-only) | Telusuri satu event: lokasi → presence → outbox → RabbitMQ → inbox → geofence_events, plus latensi |
 | `make outbox-status` | `psql` | Jumlah event outbox per status + daftar event `failed` dan error terakhirnya |
 | `make outbox-requeue` | `psql` (= `RequeueFailedOutboxEvents`) | Kembalikan event `failed` ke `pending` dengan `attempts = 0` |
 | `make dlq-status` | `rabbitmqctl list_queues` | Isi `geofence_alerts` dan `geofence_alerts.dlq` |
@@ -932,7 +1191,6 @@ Opsi `New`: `WithEnvPrefix("FLEET_")` (semua env var diberi prefix),
 
 ## Status Implementasi & Catatan
 
-Proyek masih dalam pengembangan:
 
 - **Sudah berjalan end-to-end:** MQTT ingest → PostgreSQL (lokasi, geofence, outbox) →
   outbox relay → RabbitMQ → worker (inbox, `geofence_events`) → REST API.

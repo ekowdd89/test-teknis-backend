@@ -28,6 +28,10 @@ services:
     ports:
       - "${RABBITMQ_HOST_PORT:-5673}:5672"
       - "${RABBITMQ_UI_HOST_PORT:-15673}:15672" # Management UI: http://localhost:15673
+    volumes:
+      # Plugin rabbitmq_tracing hanya untuk dev (Admin -> Tracing, make rabbit-trace-*):
+      # setiap pesan yang di-trace disalin ke file log, jadi tidak diaktifkan di produksi.
+      - ./deployments/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
 
   mosquitto:
     ports:
